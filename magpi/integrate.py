@@ -14,16 +14,19 @@ class Integrand(Protocol[T]):
         ...
 
 
-QuadRule: TypeAlias = Callable[[Array], tuple[Array, Array]]
+Weights: TypeAlias = Array
+Nodes: TypeAlias = Array
+Grid: TypeAlias = Array
+QuadRule: TypeAlias = Callable[[Grid], tuple[Weights, Nodes]]
 
 
-def midpoint(domain: Array) -> tuple[Array, Array]:
+def midpoint(domain: Array) -> tuple[Weights, Nodes]:
     w = domain[1:] - domain[:-1]
     nodes = (domain[1:] + domain[:-1]) / 2
     return w, nodes
 
 
-def trap(domain: Array) -> tuple[Array, Array]:
+def trap(domain: Array) -> tuple[Weights, Nodes]:
     a, b = zeros(len(domain)), zeros(len(domain))
     d = domain[1:] - domain[:-1]
     a = a.at[:-1].set(d)
@@ -32,7 +35,7 @@ def trap(domain: Array) -> tuple[Array, Array]:
     return w, domain
 
 
-def simpson(domain: Array) -> tuple[Array, Array]:
+def simpson(domain: Array) -> tuple[Weights, Nodes]:
     n = len(domain) + len(domain) - 1
 
     def weights(a, b):
@@ -53,18 +56,64 @@ def simpson(domain: Array) -> tuple[Array, Array]:
 def gauss(degree: int) -> QuadRule:
     nodes, weights = map(asarray, leggauss(degree))
     
-    def quad(domain: Array) -> tuple[Array, Array]:
+    def quad(domain: Array) -> tuple[Weights, Nodes]:
         def weights_nodes(a, b):
             w = (b - a) / 2 * asarray(weights)
             n = (a + b) / 2 + nodes * (b - a) / 2
             return w, n
-        w, n = vmap(weights_nodes)(domain[:-1], domain[1:])
-        return jnp.ravel(w), jnp.ravel(n)
+        return vmap(weights_nodes)(domain[:-1], domain[1:])
+
     return quad
 
 
+def make_quad_rule(domain: Array | list[Array], method: QuadRule) -> tuple[Weights, Nodes]:
+    """Creates the quadrature weights and nodes for the given domain and
+    quadrature method.
+
+    Parameters
+    ----------
+    domain : Array | list[Array]
+    method : QuadRule
+
+    Returns
+    -------
+    tuple[Weights, Nodes]
+    """
+    if not isinstance(domain, (list, tuple)):
+        assert len(domain.shape) == 1
+        if len(domain.shape) == 1:
+            domain = [domain]
+    
+    W, X = zip(*(method(d) for d in domain))
+    assert all((w.shape == x.shape) for w, x in zip(W, X)), "Invalid quadrature method"
+    
+    if len(W[0].shape) == 1:
+        W = jnp.stack(jnp.meshgrid(*W, indexing="xy"), axis=-1)
+        W = jnp.prod(W, axis=-1)
+        X = jnp.stack(jnp.meshgrid(*X, indexing="xy"), axis=-1)
+        return W, X
+    elif len(W[0].shape) == 2:
+        # gauss quadrature is given in 2d format to make it easier
+        # to get the quadrature nodes for each subdomain.
+        # Cannot be done for other methods, since they share nodes.
+        W_shape = tuple((w.shape[0] for w in W)) + tuple((w.shape[1] for w in W))
+        W = tuple(w.ravel() for w in W)
+        W = jnp.stack(jnp.meshgrid(*W), axis=-1)
+        W = jnp.prod(W, axis=-1)
+        W = W.reshape(*W_shape)
+        X_shape = tuple((x.shape[0] for x in X)) + tuple((x.shape[1] for x in X)) + (len(domain),)
+        X = tuple(x.ravel() for x in X)
+        X = jnp.stack(jnp.meshgrid(*X), axis=-1)
+        X = X.reshape(*X_shape)
+        return W, X
+    else:
+        msg = "Invalid quadrature method provided. "
+        msg += "Output must be a tuple (Weights, Nodes) of two arrays (1d or 2d) of the same shape."
+        raise ValueError(msg)
+
+
 def integrate(
-    f: Integrand[T],
+    fn: Integrand[T],
     domain: Array | list[Array],
     *args,
     method: QuadRule = simpson,
@@ -109,39 +158,39 @@ def integrate(
     domain : Array | list[Array]
         nodal points for each dimension
     method : QuadRule, optional
-        The quadrature rule is a function `Callable[[Array], tuple[Array, Array]]` which
+        The quadrature rule is a function `Callable[[Array], tuple[Weights, Nodes]]` which
         should return a tuple `(wieghts, nodes)` of the method
-        in 1d, by default simpson.
+        in 1d or 2d format, by default simpson.
 
     Returns
     -------
     ArrayTree
     """
-    if not isinstance(domain, (list, tuple)):
-        assert len(domain.shape) > 0
-        assert len(domain.shape) <= 2
-        if len(domain.shape) == 1:
-            domain = [domain]
+    W, X = make_quad_rule(domain, method)
+    return integrate_quad_rule(fn, W, X, *args, **kwargs)
 
-    W, X = zip(*(method(d) for d in domain))
-    if len(domain) > 1:
-        W = stack(jnp.meshgrid(*W), axis=-1)
-        X = stack(jnp.meshgrid(*X), axis=-1)
-        W = jnp.prod(W, axis=-1)
+
+def integrate_quad_rule(fn: Integrand[T], weights: Weights, nodes: Nodes, *args, **kwargs) -> T:
+    W, X = weights, nodes
+    F = _apply_along_last_axis(lambda x: fn(x, *args, **kwargs), X)
+    return tree.map(lambda y: _weigthed_product(W, y), F)
+
+
+def _weigthed_product(W, F):
+    _W = W[(...,) + (None,) * (F.ndim - W.ndim)]  # extend axis
+    return jnp.sum(_W * F, axis=list(range(len(W.shape))))
+
+
+def _apply_along_last_axis(f, X):
+    if X.shape[-1] == 1:
+        # domain is one dimensional, so we pass only scalar values to fn
+        return jnp.apply_along_axis(lambda x: f(x[0]), -1, X)
     else:
-        W = W[0]
-        X = X[0]
-
-    def g(x):
-        return f(x, *args, **kwargs)
-
-    F = jnp.apply_along_axis(g, -1, X)
-    
-    return tree.map(lambda z: jnp.tensordot(W, z, len(domain)), F)
+        return jnp.apply_along_axis(f, -1, X)
 
 
 def integrate_disk(
-    f: Integrand[T],
+    fn: Integrand[T],
     r: Scalar,
     o: Origin,
     n: int | tuple[int, int],
@@ -190,7 +239,7 @@ def integrate_disk(
         x = r * cos(phi)
         y = r * sin(phi)
         p = stack([x, y]) + o
-        return tree.map(lambda f: f * r, f(p, *args, **kwargs))
+        return tree.map(lambda f: f * r, fn(p, *args, **kwargs))
 
     domain = [
         jnp.linspace(r_inner, r, n[0]),
@@ -200,7 +249,7 @@ def integrate_disk(
 
 
 def integrate_sphere(
-    f: Integrand[T],
+    fn: Integrand[T],
     r: Scalar,
     o: Origin,
     n: int | tuple[int, int, int],
@@ -247,7 +296,7 @@ def integrate_sphere(
         y = r * sin(phi) * sin(theta)
         z = r * cos(phi)
         p = stack([x, y, z]) + o
-        return tree.map(lambda f: f * r ** 2 * sin(phi), f(p, *args, **kwargs))
+        return tree.map(lambda f: f * r ** 2 * sin(phi), fn(p, *args, **kwargs))
 
     domain = [
         jnp.linspace(r_inner, r, n[0]),
