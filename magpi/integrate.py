@@ -87,25 +87,15 @@ def make_quad_rule(domain: Array | list[Array], method: QuadRule) -> tuple[Weigh
     W, X = zip(*(method(d) for d in domain))
     assert all((w.shape == x.shape) for w, x in zip(W, X)), "Invalid quadrature method"
     
-    if len(W[0].shape) == 1:
-        W = jnp.stack(jnp.meshgrid(*W, indexing="xy"), axis=-1)
-        W = jnp.prod(W, axis=-1)
-        X = jnp.stack(jnp.meshgrid(*X, indexing="xy"), axis=-1)
-        return W, X
-    elif len(W[0].shape) == 2:
+    if len(W[0].shape) <= 2:
         # gauss quadrature is given in 2d format to make it easier
         # to get the quadrature nodes for each subdomain.
         # Cannot be done for other methods, since they share nodes.
-        W_shape = tuple((w.shape[0] for w in W)) + tuple((w.shape[1] for w in W))
-        W = tuple(w.ravel() for w in W)
-        W = jnp.stack(jnp.meshgrid(*W), axis=-1)
+        D = _meshgrid(*domain)
+        W = _meshgrid(*W)
         W = jnp.prod(W, axis=-1)
-        W = W.reshape(*W_shape)
-        X_shape = tuple((x.shape[0] for x in X)) + tuple((x.shape[1] for x in X)) + (len(domain),)
-        X = tuple(x.ravel() for x in X)
-        X = jnp.stack(jnp.meshgrid(*X), axis=-1)
-        X = X.reshape(*X_shape)
-        return W, X
+        X = _meshgrid(*X)
+        return W, X, D
     else:
         msg = "Invalid quadrature method provided. "
         msg += "Output must be a tuple (Weights, Nodes) of two arrays (1d or 2d) of the same shape."
@@ -166,7 +156,7 @@ def integrate(
     -------
     ArrayTree
     """
-    W, X = make_quad_rule(domain, method)
+    W, X, _ = make_quad_rule(domain, method)
     return integrate_quad_rule(fn, W, X, *args, **kwargs)
 
 
@@ -304,3 +294,15 @@ def integrate_sphere(
         jnp.linspace(theta1, theta2, n[2]),
     ]
     return integrate(g, domain, *args, method=method, **kwargs)
+
+
+def _meshgrid(*X):
+    if len(X[0].shape) <= 1:
+        return jnp.stack(jnp.meshgrid(*X), axis=-1)
+
+    indices = [jnp.arange(x.shape[0]) for x in X]
+    indices = jnp.stack(jnp.meshgrid(*indices), axis=-1)
+    def f(i):
+        M = [x[j] for x, j in zip(X, i)]
+        return jnp.stack(jnp.meshgrid(*M), axis=-1)
+    return jnp.apply_along_axis(f, -1, indices)
