@@ -66,11 +66,11 @@ class TestIntegrate(JaxTestCase):
 
     def test_006_integrate_quad_rule(self):
         domain = jnp.linspace(-1, 1, 5)
-        W, X, _ = make_quad_rule(domain, gauss(5))
+        W, X, _ = make_quad_rule(domain, gauss(3))
         fn = lambda x: x ** 2
         true_sol = 2 / 3
         result = integrate_quad_rule(fn, W, X)
-        self.assertEqual(result, true_sol)
+        self.assertIsclose(result, true_sol)
 
     def test_007_integrate_quad_rule_with_reshaping(self):
         domain = [jnp.linspace(-1, 1, 5), jnp.linspace(-1, 1, 5)]

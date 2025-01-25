@@ -20,3 +20,12 @@ class JaxTestCase(TestCase):
             tree_map(lambda a, b: jnp.isclose(a, b, atol=atol, rtol=rtol).all(), a, b),
             f"Arrays a ({_shape(a)}) and b ({_shape(b)}) are not close.",
         )
+
+    def assertPytreeEqual(self, a, b):
+        a_shapes = tree.map(lambda a: asarray(a).shape, a)
+        b_shapes = tree.map(lambda b: asarray(b).shape, b)
+        self.assertEqual(a_shapes, b_shapes, f"Shapes of pytrees `{a_shapes}` and `{b_shapes}` are not equal")
+        a_leaves = tree.leaves(a)
+        b_leaves = tree.leaves(b)
+        all_equal = all([jnp.all(_a == _b) for _a, _b in zip(a_leaves, b_leaves)])
+        self.assertTrue(all_equal, "Arrays are not equal")

@@ -1,10 +1,10 @@
-from typing import Callable
+from typing import Callable, TypeVar
 
 from .prelude import *
 import chex
 
 # some function taken from jaxopt:
-
+T = TypeVar("T", bound=Callable[..., chex.ArrayTree])
 
 def make_funs_with_aux(fun: Callable, value_and_grad: bool, has_aux: bool):
     if value_and_grad:
@@ -53,3 +53,31 @@ def tree_dim(tree: chex.ArrayTree, axis=0) -> int:
         len(dim) == 1
     ), f"Dimension mismatch! All arrays must have same size along axis {axis}."
     return dim.pop()
+
+
+def apply_along_last_dims(
+    func: Callable[..., T], *arr: chex.ArrayTree, dims=1
+) -> T:
+    """Uses vmap to apply a function over all axes of an array
+    except the last ones specified by `dims`.
+
+    Parameters
+    ----------
+    func1d : Callable
+    *args : ArrayTree
+    dims : int, optional
+        The number of remaining axes. If 0 the function is
+        applied on each scalar of the array. Default is 1
+
+    Returns
+    -------
+    ArrayTree
+    """
+    _dims = [a.ndim for a in tree.leaves(arr)]
+    max_dims = max(_dims)
+    vmap_dims = max_dims - dims
+
+    for axis in range(0, vmap_dims):
+        func = jax.vmap(func, in_axes=axis, out_axes=axis)
+
+    return func(*arr)
