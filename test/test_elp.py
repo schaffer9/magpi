@@ -160,7 +160,25 @@ class TestIntegrateLegendreCell(JaxTestCase):
         result = _integrate_legendre_cell(
             adf, 5, D, splits=1, support_nodes=1, max_depth=1
         )
+        print(result, true_result)
         self.assertIsclose(result, true_result)
+        
+    def test_003_integrate1d_max_depth1_splits2(self):
+        def adf(x):
+            return jnp.sum(x)
+        domain = jnp.linspace(-1, 1, 2)
+        _, _, D = make_quad_rule([domain], method=gauss(3))
+        
+        def integrand(x):
+            return legendre_polynomial(x, 5)
+        
+        W, X, _ = make_quad_rule([jnp.linspace(0, 1, 2)], method=gauss(3))
+        true_result = integrate_quad_rule(integrand, W, X)
+         
+        result = _integrate_legendre_cell(
+            adf, 5, D, splits=[2, 2], support_nodes=1, max_depth=6
+        )
+        self.assertIsclose(result, true_result, atol=1e-3)
 
 
 class TestIntegrateLegendre(JaxTestCase):

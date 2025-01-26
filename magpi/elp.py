@@ -1,9 +1,9 @@
 """
-This module offers an implementation of Equivalent Legendre polynomials [1]_. 
+This module offers an implementation of Equivalent Legendre polynomials [1]_.
 
 Notes
 -----
-.. [1] Abedian, Alireza, and Alexander Düster. 
+.. [1] Abedian, Alireza, and Alexander Düster.
    "Equivalent Legendre polynomials: Numerical integration of discontinuous functions in the finite element methods." 
    Computer Methods in Applied Mechanics and Engineering 343 (2019): 690-720.
 """
@@ -133,7 +133,7 @@ def domain_masks(
         _make_mask_for_indices, tuple(dim - 1 for dim in domain.shape[:-1])
     )
     return broken_cell_mask, padding_cell_mask, count_fraction
-    
+
 
 def _make_support_nodes(domain: Domain, support_nodes: int | Sequence[int]) -> Array:
     d = len(domain.shape) - 1
@@ -167,6 +167,7 @@ def integrate_legendre(
     support_nodes: int | Sequence[int] = 3,
     eps: float = 1e-6,
     max_depth: int = 3,
+    batch_size: None | int = None,
     **kwargs: Any
 ) -> tuple[Moments, LegendreCoefs]:
     """Computes moments and coefficients for the given domain for the
@@ -183,11 +184,13 @@ def integrate_legendre(
         the number of Legendre polynomials for each dimension, the polynomial degree is `degree + 1`
     domain : Domain
         domain cell grid
+    args : Any
+        positional arguments for `adf`
     splits : int | Sequence[int], optional
         number of splits for the recursive algorithm for each dimension, by default 1;
         e.g. 1 corresponds to each cell being split at the center.
     support_nodes : int | Sequence[int], optional
-        number of support points for each dimension which are 
+        number of support points for each dimension which are
         used to compute the support fraction, by default 3;
         this fraction is used on the lowest level of the tree
         to approximate the integral inside the domain.
@@ -195,7 +198,10 @@ def integrate_legendre(
         threshold parameter for domain masks, by default 1e-6
     max_depth : int, optional
         maximum depth of the spacetree, by default 3
-
+    batch_size : int, optional
+        setting a small batch size decreases memory consumption but increases runtime, by default None
+    kwargs : Any
+        keyword Arguments for `adf`
     Returns
     -------
     tuple[Moments, LegendreCoefs]
@@ -206,7 +212,8 @@ def integrate_legendre(
         _adf, centered_domain = _center(adf, cell_domain)
         moments = _integrate_legendre_cell(_adf, degree, centered_domain, *args,
                                            splits=splits, support_nodes=support_nodes,
-                                           eps=eps, depth=0, max_depth=max_depth, **kwargs)
+                                           eps=eps, max_depth=max_depth, batch_size=batch_size,
+                                           **kwargs)
         
         # compute coefs:
         c = [(2 * jnp.arange(d) + 1) / 2 for d in moments.shape]
@@ -278,6 +285,7 @@ def _integrate_legendre_cell(
     eps: float = 1e-6,
     depth: int = 0,
     max_depth: int = 3,
+    batch_size: None | int = None,
     **kwargs: Any
 ) -> Array:
     d = cell_domain.ndim - 1
@@ -285,7 +293,7 @@ def _integrate_legendre_cell(
         splits = [splits] * d
     broken_cell_mask, padding_cell_mask, ratio = domain_masks(
         adf, cell_domain, *args, eps=eps, support_nodes=support_nodes, **kwargs)
-    
+
     @partial(jit, inline=False)
     def _recursive_call(idx):
         padding = padding_cell_mask[*idx]
@@ -300,19 +308,30 @@ def _integrate_legendre_cell(
         IP = lax.cond(
             padding, lambda: zeros_like(IP), lambda: IP
         )
-        
+
         if depth == max_depth:
             return IP * r
         else:
             new_domain = [jnp.linspace(lower, upper, s + 2) for lower, upper, s in zip(Dl, Du, splits)]
             new_domain = jnp.stack(jnp.meshgrid(*new_domain), axis=-1)
+
+            @partial(jit, donate_argnames=("new_domain",), inline=False)
+            def int_legendre(new_domain):
+                return _integrate_legendre_cell(
+                    adf, degree, new_domain, *args,
+                    support_nodes=support_nodes, eps=eps, depth=depth + 1,
+                    max_depth=max_depth, batch_size=batch_size, **kwargs)
+                
             return lax.cond(
                 broken,
-                lambda: _integrate_legendre_cell(
-                    adf, degree, new_domain, *args, 
-                    support_nodes=support_nodes, eps=eps, depth=depth + 1,
-                    max_depth=max_depth, **kwargs),
+                lambda: int_legendre(new_domain),
                 lambda: IP
             )
-    return jnp.sum(_apply_on_indices(_recursive_call, broken_cell_mask.shape), axis=list(range(d)))
     
+    indices = jnp.indices(broken_cell_mask.shape)
+    indices = jnp.moveaxis(indices, 0, -1)
+    indices = indices.reshape(-1, d)
+    if batch_size is not None and depth > 1:
+        return jnp.sum(lax.map(_recursive_call, indices, batch_size=batch_size), axis=0)
+    else:
+        return jnp.sum(vmap(_recursive_call)(indices), axis=0)

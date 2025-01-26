@@ -124,6 +124,7 @@ def make_elp_quad_rule(
     support_nodes: int | Sequence[int] = 3,
     eps: float = 1e-6,
     max_depth: int = 3,
+    batch_size: None | int = None,
     **kwargs: Any
 ) -> tuple[Weights, Nodes, Domain, BrokenCellMask, PaddingMask]:
     """Creates an accurate quadrature rule for an arbitrary geometry, which 
@@ -163,6 +164,7 @@ def make_elp_quad_rule(
         max_depth=max_depth,
         support_nodes=support_nodes,
         eps=eps,
+        batch_size=batch_size,
         **kwargs
     )
     W_new = compute_elp_weights(coefs, W, X, D)
