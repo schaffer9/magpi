@@ -11,6 +11,7 @@ from magpi.r_fun import (
     translate,
     scale,
     project,
+    newton_iteration
 )
 
 from . import *
@@ -237,7 +238,6 @@ class TestSphere(JaxTestCase):
     def test_00_sphere(self):
         s = sphere(2.0)
         y = s(array([2.0, 0.0]))
-        print(norm(grad(s)(array([2.0, 0.0]))))
         self.assertIsclose(y, 0.0)
         self.assertIsclose(norm(grad(s)(array([2.0, 0.0]))), 1.0)
         self.assertIsclose(norm(grad(s)(array([0.0, 2.0]))), 1.0)
@@ -250,3 +250,23 @@ class TestSphere(JaxTestCase):
 
         self.assertIsclose(normal_derivative(s)(1.0), 1.0)
         self.assertIsclose(normal_derivative(s)(-1.0), 1.0)
+
+
+class TestNewtonIteration(JaxTestCase):
+    def test_001_newton_iteration_sphere(self):
+        adf = sphere(0.5)
+        x = newton_iteration(
+            adf,
+            array([0.2, 0.2, 0.3]),  # x0
+        )
+        self.assertIsclose(adf(x), 0.0)
+        
+    def test_002_newton_iteration_sphere_with_bounds(self):
+        adf = sphere(0.5)
+        x = newton_iteration(
+            adf,
+            array([0.15, 0.12, 0.17]),  # x0
+            array([0, 0, 0.]),  # lb
+            array([0.2, 0.2, 0.2])  # ub
+        )
+        self.assertIsclose(x, array([0.2, 0.2, 0.2]))

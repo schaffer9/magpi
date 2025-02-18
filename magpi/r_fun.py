@@ -1,4 +1,5 @@
-from typing import Annotated, Callable
+from typing import Annotated, Callable, Any, NamedTuple, TypeAlias
+import itertools
 
 from .prelude import *
 from .quaternions import (
@@ -561,3 +562,266 @@ def normalize_1st_order(adf: ADF) -> ADF:
         return y / sqrt(y**2 + norm(dy) ** 2)
 
     return normalize
+
+
+def newton_iteration(
+    adf: ADF,
+    x0: Vec,
+    lower_bound: Vec | None = None,
+    upper_bound: Vec | None = None,
+    *args,
+    tol: float = 1e-7,
+    maxiter=10,
+    **kwargs
+) -> Array:
+    """A box constraint newton iteration algorithm which performs the newton iteration
+    along the gradient vector. This can be efficiently used to find points on the 
+    boundary of the ADF.
+
+    If no constraints are provided, the algorithm is unconstraint.
+    
+    Parameters
+    ----------
+    adf : ADF
+    x0 : Vec
+        Initial point
+    lower_bound : Vec | None, optional
+        by default None
+    upper_bound : Vec | None, optional
+        by default None
+    tol : float, optional
+        iteration is stopped if `|adf| < tol` , by default 1e-7
+
+    Returns
+    -------
+    Array
+        Point on the boundary with `adf=0` or on the box boundary
+    """
+    lb = asarray(-jnp.inf) if lower_bound is None else asarray(lower_bound)
+    ub = asarray(jnp.inf) if upper_bound is None else asarray(upper_bound)
+    x = asarray(x0)
+    f, Jf = adf(x, *args, **kwargs), jacfwd(adf)(x, *args, **kwargs)
+    
+    def body(state):
+        f, Jf, x, k = state
+        m = Jf
+        m = asarray(jnp.where(jnp.isclose(x, lb), 0.0, m))
+        m = asarray(jnp.where(jnp.isclose(x, ub), 0.0, m))
+        d = - (f / (Jf @ m) * m)
+        t = jnp.min(jnp.asarray(jnp.where(
+            jnp.isclose(d, 0), jnp.inf,
+            jnp.where(d < 0, (lb - x) / d, (ub - x) / d)
+        )))
+
+        t = jnp.minimum(t, 1)
+        x = x + t * d
+        f = adf(x, *args, **kwargs)
+        Jf = jacfwd(adf)(x, *args, **kwargs)
+        return f, Jf, x, k + 1
+    
+    def condition(state):
+        f, Jf, x, k = state
+        m = Jf
+        m = asarray(jnp.where(jnp.isclose(x, lb), 0.0, m))
+        m = asarray(jnp.where(jnp.isclose(x, ub), 0.0, m))
+        return ((jnp.abs(f) >= tol) & (~jnp.allclose(m, 0.0))) & (k < maxiter)
+    
+    _, _, x, _ = lax.while_loop(condition, body, (f, Jf, x, 0))
+    return x
+
+
+class Cell(NamedTuple):
+    lower_bound: Array
+    upper_bound: Array
+    broken: Array
+    padding: Array
+
+    def cell_count(self):
+        return len(self.broken)
+
+    def support(self):
+        return jnp.prod((self.upper_bound - self.lower_bound), axis=-1)
+
+
+Cells: TypeAlias = Cell
+
+
+@partial(jit, static_argnames=("adf", "max_cells"))
+def partition_domain(
+    adf: ADF,
+    lower_bounds: Array,
+    upper_bounds: Array,
+    *args: Any,
+    eps: float = 1e-6,
+    max_depth: int = 8,
+    max_cells: int = 100_000,
+    **kwargs: Any,
+) -> Cells:
+    """Partitions the domain contained by the approximate distance function `adf`
+    and `lower_bounds` and `upper_bounds` into cells with a space tree algorithm.
+    The resolution becomes smaller and smaller it the boundary of the domain is approached
+    until the maximum resolution is reached. The maximum resolution is based on `max_depth`
+    and `max_cells`.
+
+    The algorithm refines the domain iteratively since a recursive approach would require
+    huge amounts of memory in JAX.
+
+    Parameters
+    ----------
+    adf : ADF
+        approximate distance function
+    lower_bounds : Array
+    upper_bounds : Array
+    eps : float, optional
+        controlls the precision whether a cell is contained by the `adf`, by default 1e-6
+    max_depth : int, optional
+        maximum depth of the space tree, by default 8
+    max_cells : int, optional
+        maximum number of cells; if less cells are required, the remaining cells are only for
+        padding; by default 100_000
+
+    Returns
+    -------
+    Cells
+        Domain partitioned into computational cells
+    """
+    lb, ub = asarray(lower_bounds), asarray(upper_bounds)
+    lower_bounds = zeros((max_cells, lb.shape[0]))
+    upper_bounds = zeros((max_cells, ub.shape[0]))
+    broken_mask = jnp.full((max_cells,), False)
+    padding_mask = jnp.full((max_cells,), True)
+    d = lb.shape[0]
+    n = 2**d
+    assert lower_bounds.shape == upper_bounds.shape
+
+    lower_bounds = lower_bounds.at[0].set(lb)
+    upper_bounds = upper_bounds.at[0].set(ub)
+
+    is_broken_cell, is_padding_cell = _broken_or_padding_cell(adf, lb, ub, *args, eps=eps, **kwargs)
+
+    broken_mask = broken_mask.at[0].set(is_broken_cell)
+    padding_mask = padding_mask.at[0].set(is_padding_cell)
+    cells = Cell(lower_bounds, upper_bounds, broken_mask, padding_mask)
+
+    def split(cell):
+        lb, ub, broken, padding = cell
+
+        def _no_split():
+            lower_bounds = zeros((n, lb.shape[0]))
+            lower_bounds = lower_bounds.at[0].set(lb)
+            upper_bounds = zeros((n, ub.shape[0]))
+            upper_bounds = upper_bounds.at[0].set(ub)
+            broken_mask = jnp.full((n,), False)
+            broken_mask = broken_mask.at[0].set(broken)
+            padding_mask = jnp.full((n,), True)
+            padding_mask = padding_mask.at[0].set(padding)
+            new_cells = Cell(lower_bounds, upper_bounds, broken_mask, padding_mask)
+            return new_cells
+
+        def _split():
+            new_cells = _split_cell(adf, lb, ub, *args, eps=eps, **kwargs)
+            return new_cells
+
+        return lax.cond(broken & jnp.logical_not(padding), _split, _no_split)
+
+    def update(i, cells):
+        new_cells = vmap(split)(cells)
+        new_cells = new_cells._replace(
+            lower_bound=new_cells.lower_bound.reshape(-1, d),
+            upper_bound=new_cells.upper_bound.reshape(-1, d),
+            broken=new_cells.broken.reshape(-1),
+            padding=new_cells.padding.reshape(-1),
+        )
+
+        mask = new_cells.padding
+        new_cell_count = jnp.count_nonzero(jnp.logical_not(mask))
+
+        # if the maximum depth is reached, cells with the center outside the domain
+        # are removed. This increases the accuracy.
+        mask = lax.cond(
+            (i == (max_depth - 1)) | (new_cell_count > max_cells),
+            lambda: vmap(lambda c: jnp.logical_not(_inside_adf(adf, c, *args, **kwargs)))(new_cells) | mask,
+            lambda: mask,
+        )
+        new_cells = new_cells._replace(padding=mask)
+        new_cell_count = jnp.count_nonzero(jnp.logical_not(mask))
+        cell_overflow = new_cell_count > max_cells
+        idx = jnp.argsort(mask)
+        idx = idx[:max_cells]
+
+        _cells = cells._replace(
+            lower_bound=new_cells.lower_bound[idx],
+            upper_bound=new_cells.upper_bound[idx],
+            broken=new_cells.broken[idx],
+            padding=new_cells.padding[idx],
+        )
+        return lax.cond(cell_overflow, lambda: cells, lambda: _cells)
+
+    cells = lax.fori_loop(0, max_depth, update, cells)
+    cells = vmap(_pad_cell)(cells)  # set all padding cells to zero
+
+    return cells
+
+
+def _pad_cell(cell):
+    lb, ub, _, padding_cell = cell
+    return lax.cond(
+        padding_cell,
+        lambda: Cell(
+            lower_bound=zeros_like(lb),
+            upper_bound=zeros_like(ub),
+            broken=asarray(False),
+            padding=asarray(True),
+        ),
+        lambda: cell,
+    )
+
+
+def _inside_adf(adf, cell, *args, **kwargs):
+    lb, ub, _, _ = cell
+    c = (lb + ub) / 2
+    return adf(c, *args, **kwargs) >= 0
+
+
+@partial(jit, static_argnames=("adf",))
+def _split_cell(adf: ADF, lb, ub, *args: Any, eps=1e-6, **kwargs: Any) -> Cell:
+    split_point = (lb + ub) / 2
+    lower_bounds, upper_bounds, broken_cells, padding_cells = [], [], [], []
+    for split in itertools.product([0, 1], repeat=len(lb)):
+        new_lower = where(array(split) == 0, lb, split_point)
+        new_upper = where(array(split) == 0, split_point, ub)
+        broken_cell, padding_cell = _broken_or_padding_cell(adf, new_lower, new_upper, *args, eps=eps, **kwargs)
+        lower_bounds.append(new_lower)
+        upper_bounds.append(new_upper)
+        broken_cells.append(broken_cell)
+        padding_cells.append(padding_cell)
+
+    lower_bounds = asarray(lower_bounds)
+    upper_bounds = asarray(upper_bounds)
+    broken_cells = asarray(broken_cells)
+    padding_cells = asarray(padding_cells)
+    return Cell(lower_bounds, upper_bounds, broken_cells, padding_cells)
+
+
+_BrokenCellMask: TypeAlias = Array
+_PaddingMask: TypeAlias = Array
+
+
+@partial(jit, static_argnames=("adf",))
+def _broken_or_padding_cell(adf: ADF, lb, ub, *args: Any, eps=1e-6, **kwargs: Any) -> tuple[_BrokenCellMask, _PaddingMask]:
+    support = jnp.prod((ub - lb) / 2)
+    assert lb.shape[0] == ub.shape[0]
+    dim = lb.shape[0]
+    cell_domain = jnp.stack(jnp.meshgrid(*[jnp.array([l, u]) for l, u in zip(lb, ub)]), axis=-1)
+    center = (lb + ub) / 2
+
+    LD = jnp.apply_along_axis(adf, -1, cell_domain, *args, **kwargs)
+    LX = adf(center)
+    max_count = 1 + 2**dim
+    nD = jnp.sum(LD >= 0 - eps)
+    nX = asarray((LX >= (0 - eps))).astype(nD.dtype)
+    n = nD + nX
+    padding_cell = ((n == 0) | ((nX == 0) & jnp.all(LD <= 0 + eps))) | (support == 0)
+    broken_cell = (n != max_count) & (n > 0)
+    broken_cell = asarray(jnp.where(padding_cell, False, broken_cell))
+    return broken_cell, padding_cell
